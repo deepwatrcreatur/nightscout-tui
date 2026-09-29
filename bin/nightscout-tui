@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+Nightscout TUI - High-resolution Unicode terminal monitor for Nightscout CGM telemetry.
+Zero external Python dependencies; renders via terminal Braille patterns & ANSI color codes.
+"""
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+from datetime import datetime, timezone
+import urllib.request
+import urllib.error
+
+# Direction arrows mapping
+DIRECTION_MAP = {
+    "DoubleUp": "⇈",
+    "SingleUp": "↑",
+    "FortyFiveUp": "↗",
+    "Flat": "→",
+    "FortyFiveDown": "↘",
+    "SingleDown": "↓",
+    "DoubleDown": "⇊",
+    "NOT COMPUTABLE": "─",
+    "RATE OUT OF RANGE": "!",
+}
+
+# ANSI Color Codes
+RESET = "\033[0m"
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+GRAY = "\033[90m"
+WHITE = "\033[37m"
+DIM = "\033[2m"
+
+def parse_args():
+    parser = argparse.ArgumentParser(prog="nightscout-tui", description="Nightscout TUI Monitor")
+    parser.add_argument(
+        "--url",
+        default=os.environ.get("NIGHTSCOUT_URL", "https://nightscout.deepwatercreature.com"),
+        help="Nightscout base URL (env: NIGHTSCOUT_URL)",
+    )
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("NIGHTSCOUT_TOKEN", None),
+        help="Nightscout API authentication token or secret (env: NIGHTSCOUT_TOKEN)",
+    )
+    parser.add_argument(
+        "--token-file",
+        default=os.environ.get("NIGHTSCOUT_TOKEN_FILE", None),
+        help="Path to file containing Nightscout API token (env: NIGHTSCOUT_TOKEN_FILE)",
+    )
+    parser.add_argument(
+        "--units",
+        choices=["mg/dl", "mmol/l"],
+        default=os.environ.get("DISPLAY_UNITS", "mg/dl").lower(),
+        help="Display units: mg/dl or mmol/l (default: mg/dl)",
+    )
+    parser.add_argument(
+        "--low",
+        type=float,
+        default=float(os.environ.get("TARGET_LOW", 70)),
+        help="Target lower threshold in mg/dL (default: 70)",
+    )
+    parser.add_argument(
+        "--high",
+        type=float,
+        default=float(os.environ.get("TARGET_HIGH", 180)),
+        help="Target upper threshold in mg/dL (default: 180)",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=int(os.environ.get("ENTRIES_COUNT", 48)),
+        help="Number of historical entries to fetch (default: 48 = 4h)",
+    )
+    parser.add_argument(
+        "--refresh",
+        type=int,
+        default=int(os.environ.get("REFRESH_SECONDS", 60)),
+        help="Refresh interval in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch and render once, then exit immediately",
+    )
+    args = parser.parse_args()
+
+    # Load token from file if provided and not explicitly set via --token
+    if not args.token and args.token_file:
+        try:
+            with open(args.token_file, "r") as f:
+                args.token = f.read().strip()
+        except OSError as e:
+            sys.stderr.write(f"Warning: Could not read token file {args.token_file}: {e}\n")
+
+    return args
+
+def format_bg(sgv, units):
+    if units == "mmol/l":
+        return f"{sgv / 18.0182:.1f}"
+    return f"{int(round(sgv))}"
+
+def get_color(sgv, low, high):
+    if sgv < low:
+        return RED
+    elif sgv > high:
+        return YELLOW
+    return GREEN
+
+def fetch_entries(base_url, token, count):
+    url = f"{base_url.rstrip('/')}/api/v1/entries.json?count={count}"
+    if token:
+        url += f"&token={token}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "NightscoutTUI/1.0",
+        },
+    )
+    if token:
+        req.add_header("api-secret", token)
+
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+def render_braille_graph(entries, target_low, target_high, units="mg/dl", width=60, height=12):
+    """Draws a high-resolution scatter plot using Unicode 2x4 braille dot matrix."""
+    if not entries:
+        return []
+
+    pts = list(reversed(entries))
+    sgvs = [p["sgv"] for p in pts if "sgv" in p and isinstance(p["sgv"], (int, float))]
+    if not sgvs:
+        return []
+
+    min_val = min(min(sgvs) - 10, target_low - 10)
+    max_val = max(max(sgvs) + 10, target_high + 20)
+    val_range = max(1.0, max_val - min_val)
+
+    pixel_w = width * 2
+    pixel_h = height * 4
+    grid = [[0 for _ in range(pixel_w)] for _ in range(pixel_h)]
+
+    step = max(1.0, len(sgvs) / float(pixel_w))
+    for px in range(min(pixel_w, len(sgvs))):
+        idx = int(px * step)
+        if idx < len(sgvs):
+            val = sgvs[idx]
+            py = int(((val - min_val) / val_range) * (pixel_h - 1))
+            py = max(0, min(pixel_h - 1, py))
+            grid[py][px] = 1
+
+    braille_rows = []
+    for char_y in range(height - 1, -1, -1):
+        row_str = ""
+        current_y_val = min_val + ((char_y * 4 + 2) / float(pixel_h)) * val_range
+
+        formatted_val = format_bg(current_y_val, units)
+        axis_label = f"{formatted_val:>5s} │ "
+
+        if abs(current_y_val - target_high) < (val_range / height):
+            axis_label = f"{YELLOW}{formatted_val:>5s} ┄{RESET} "
+        elif abs(current_y_val - target_low) < (val_range / height):
+            axis_label = f"{RED}{formatted_val:>5s} ┄{RESET} "
+
+        for char_x in range(width):
+            px_start = char_x * 2
+            py_start = char_y * 4
+            code = 0
+            dots = [
+                (0, 0, 0x01), (0, 1, 0x02), (0, 2, 0x04), (1, 0, 0x08),
+                (1, 1, 0x10), (1, 2, 0x20), (0, 3, 0x40), (1, 3, 0x80)
+            ]
+            for dx, dy, bit in dots:
+                gy = py_start + dy
+                gx = px_start + dx
+                if 0 <= gy < pixel_h and 0 <= gx < pixel_w and grid[gy][gx]:
+                    code |= bit
+
+            char = chr(0x2800 + code) if code != 0 else " "
+            row_str += char
+
+        braille_rows.append(axis_label + row_str)
+
+    return braille_rows
+
+def main():
+    args = parse_args()
+
+    # Handle clean termination
+    def handle_sigint(_sig, _frame):
+        sys.stdout.write(f"\n{RESET}Exiting Nightscout TUI.\n")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
+
+    is_tty = sys.stdout.isatty()
+    if not args.once and is_tty:
+        sys.stdout.write("\033[2J\033[H")  # Clear screen and move cursor to home
+        sys.stdout.flush()
+
+    while True:
+        try:
+            entries = fetch_entries(args.url, args.token, args.count)
+            if not entries:
+                sys.stdout.write("No glucose entries returned from Nightscout.\n")
+                if args.once:
+                    break
+                time.sleep(args.refresh)
+                continue
+
+            latest = entries[0]
+            sgv = latest.get("sgv", 0)
+            direction = latest.get("direction", "")
+            arrow = DIRECTION_MAP.get(direction, "")
+
+            delta_str = ""
+            if len(entries) > 1:
+                prev_sgv = entries[1].get("sgv", sgv)
+                diff = sgv - prev_sgv
+                if args.units == "mmol/l":
+                    delta_str = f"{diff / 18.0182:+.1f} mmol/L"
+                else:
+                    delta_str = f"{int(round(diff)):+d} mg/dL"
+
+            date_ms = latest.get("date", 0)
+            entry_time = datetime.fromtimestamp(date_ms / 1000.0, tz=timezone.utc).astimezone()
+            mins_ago = int((time.time() - (date_ms / 1000.0)) / 60.0)
+
+            color = get_color(sgv, args.low, args.high)
+            bg_display = format_bg(sgv, args.units)
+
+            try:
+                term_w, term_h = os.get_terminal_size()
+            except OSError:
+                term_w, term_h = (80, 24)
+
+            graph_w = max(30, min(100, term_w - 12))
+            graph_h = max(6, min(20, term_h - 10))
+
+            output = ["\033[H"] if (not args.once and is_tty) else []
+            output.append(f"{BOLD}Nightscout Live Monitor{RESET}  {GRAY}[{args.url}]{RESET}\n")
+            output.append(f"  {color}{BOLD}{bg_display} {args.units} {arrow}{RESET}   {delta_str}   {GRAY}({mins_ago}m ago · {entry_time.strftime('%I:%M:%S %p')}){RESET}\n")
+            
+            low_disp = format_bg(args.low, args.units)
+            high_disp = format_bg(args.high, args.units)
+            output.append(f"  {GRAY}Target Range: {low_disp} – {high_disp} {args.units}{RESET}\n")
+
+            for line in render_braille_graph(entries, args.low, args.high, units=args.units, width=graph_w, height=graph_h):
+                output.append("  " + line)
+
+            output.append(f"  {GRAY}{'':5s} └{'─' * graph_w}▶ (Past {max(1, args.count * 5 // 60)}h Trend){RESET}")
+
+            sys.stdout.write("\n".join(output) + "\n")
+            sys.stdout.flush()
+
+        except Exception as e:
+            sys.stdout.write(f"\r{RED}Fetch error: {e}{RESET}\n")
+            sys.stdout.flush()
+
+        if args.once:
+            break
+
+        time.sleep(args.refresh)
+
+if __name__ == "__main__":
+    main()
