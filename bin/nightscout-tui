@@ -152,32 +152,39 @@ def fetch_entries(base_url, token, count, insecure=False, ca_cert=None):
     with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
+from datetime import datetime, timezone, timedelta
+
 def render_braille_graph(entries, target_low, target_high, units="mg/dl", width=60, height=12):
-    """Draws a high-resolution scatter plot using Unicode 2x4 braille dot matrix."""
+    """Draws a high-resolution scatter plot using Unicode 2x4 braille dot matrix and time-stamped X axis."""
     if not entries:
-        return []
+        return [], "", ""
 
-    pts = list(reversed(entries))
-    sgvs = [p["sgv"] for p in pts if "sgv" in p and isinstance(p["sgv"], (int, float))]
-    if not sgvs:
-        return []
+    pts = list(reversed([p for p in entries if "sgv" in p and isinstance(p["sgv"], (int, float)) and "date" in p]))
+    if not pts:
+        return [], "", ""
 
+    sgvs = [p["sgv"] for p in pts]
     min_val = min(min(sgvs) - 10, target_low - 10)
     max_val = max(max(sgvs) + 10, target_high + 20)
     val_range = max(1.0, max_val - min_val)
+
+    t_start = pts[0]["date"] / 1000.0
+    t_end = pts[-1]["date"] / 1000.0
+    duration = max(1.0, t_end - t_start)
 
     pixel_w = width * 2
     pixel_h = height * 4
     grid = [[0 for _ in range(pixel_w)] for _ in range(pixel_h)]
 
-    step = max(1.0, len(sgvs) / float(pixel_w))
-    for px in range(min(pixel_w, len(sgvs))):
-        idx = int(px * step)
-        if idx < len(sgvs):
-            val = sgvs[idx]
-            py = int(((val - min_val) / val_range) * (pixel_h - 1))
-            py = max(0, min(pixel_h - 1, py))
-            grid[py][px] = 1
+    # Map each entry proportionally across the full time domain
+    for p in pts:
+        t = p["date"] / 1000.0
+        px = int(round(((t - t_start) / duration) * (pixel_w - 1)))
+        px = max(0, min(pixel_w - 1, px))
+        val = p["sgv"]
+        py = int(((val - min_val) / val_range) * (pixel_h - 1))
+        py = max(0, min(pixel_h - 1, py))
+        grid[py][px] = 1
 
     braille_rows = []
     for char_y in range(height - 1, -1, -1):
@@ -211,7 +218,73 @@ def render_braille_graph(entries, target_low, target_high, units="mg/dl", width=
 
         braille_rows.append(axis_label + row_str)
 
-    return braille_rows
+    # Determine X-axis ticks along time domain
+    dur_hours = duration / 3600.0
+    if dur_hours <= 2.5:
+        step_minutes = 30
+    elif dur_hours <= 6.0:
+        step_minutes = 60
+    elif dur_hours <= 12.0:
+        step_minutes = 120
+    else:
+        step_minutes = 240
+
+    start_dt = datetime.fromtimestamp(t_start, tz=timezone.utc).astimezone()
+    end_dt = datetime.fromtimestamp(t_end, tz=timezone.utc).astimezone()
+
+    start_min = start_dt.minute
+    rem = start_min % step_minutes
+    first_tick_dt = start_dt.replace(second=0, microsecond=0) + timedelta(minutes=(step_minutes - rem if rem != 0 else step_minutes))
+
+    ticks = []
+    cur = first_tick_dt
+    while cur.timestamp() < t_end:
+        col = int(round(((cur.timestamp() - t_start) / duration) * (width - 1)))
+        lbl = cur.strftime("%H:%M")
+        ticks.append((col, lbl))
+        cur += timedelta(minutes=step_minutes)
+
+    axis_chars = ["─"] * width
+    for col, _ in ticks:
+        if 0 <= col < width:
+            axis_chars[col] = "┬"
+    axis_line = "".join(axis_chars)
+
+    # Build X-axis time label line
+    label_chars = [" "] * width
+    placed_spans = []
+
+    # End label at right edge (latest reading time)
+    end_lbl = end_dt.strftime("%H:%M")
+    end_start = max(0, width - len(end_lbl))
+    for i, ch in enumerate(end_lbl):
+        if end_start + i < width:
+            label_chars[end_start + i] = ch
+    placed_spans.append((end_start, end_start + len(end_lbl)))
+
+    # Start label at left edge if not colliding
+    start_lbl = start_dt.strftime("%H:%M")
+    if len(start_lbl) + 2 < end_start:
+        for i, ch in enumerate(start_lbl):
+            if i < width:
+                label_chars[i] = ch
+        placed_spans.append((0, len(start_lbl)))
+
+    # Intermediate ticks
+    for col, lbl in ticks:
+        l_start = col - len(lbl) // 2
+        l_end = l_start + len(lbl)
+        if l_start < 0 or l_end > width:
+            continue
+        collides = any(not (l_end + 1 < s or l_start > e + 1) for s, e in placed_spans)
+        if not collides:
+            for i, ch in enumerate(lbl):
+                label_chars[l_start + i] = ch
+            placed_spans.append((l_start, l_end))
+
+    time_labels = "".join(label_chars).rstrip()
+
+    return braille_rows, axis_line, time_labels
 
 def main():
     args = parse_args()
@@ -223,6 +296,10 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
+
+    # Handle terminal resize
+    if hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, lambda _sig, _frame: None)
 
     is_tty = sys.stdout.isatty()
     if not args.once and is_tty:
@@ -265,8 +342,9 @@ def main():
             except OSError:
                 term_w, term_h = (80, 24)
 
-            graph_w = max(30, min(100, term_w - 12))
-            graph_h = max(6, min(20, term_h - 10))
+            # Dynamically stretch to fill terminal width and height
+            graph_w = max(30, term_w - 10)
+            graph_h = max(6, min(35, term_h - 11))
 
             output = ["\033[H"] if (not args.once and is_tty) else []
             output.append(f"{BOLD}Nightscout Live Monitor{RESET}  {GRAY}[{args.url}]{RESET}\n")
@@ -276,10 +354,15 @@ def main():
             high_disp = format_bg(args.high, args.units)
             output.append(f"  {GRAY}Target Range: {low_disp} – {high_disp} {args.units}{RESET}\n")
 
-            for line in render_braille_graph(entries, args.low, args.high, units=args.units, width=graph_w, height=graph_h):
+            rows, axis_line, time_labels = render_braille_graph(
+                entries, args.low, args.high, units=args.units, width=graph_w, height=graph_h
+            )
+
+            for line in rows:
                 output.append("  " + line)
 
-            output.append(f"  {GRAY}{'':5s} └{'─' * graph_w}▶ (Past {max(1, args.count * 5 // 60)}h Trend){RESET}")
+            output.append(f"  {GRAY}{'':5s} └{axis_line}▶{RESET}")
+            output.append(f"  {GRAY}{'':7s}{time_labels}{RESET}")
 
             sys.stdout.write("\n".join(output) + "\n")
             sys.stdout.flush()
